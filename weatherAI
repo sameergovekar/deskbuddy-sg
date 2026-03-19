@@ -14,7 +14,7 @@ from googleapiclient.discovery import build
 # CONFIG
 # ---------------------------------
 
-OPENAI_API_KEY = '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'
+OPENAI_API_KEY = ''
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 GCAL_SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]

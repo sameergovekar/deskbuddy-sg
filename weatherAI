@@ -1,0 +1,464 @@
+from flask import Flask, request, jsonify
+from openai import OpenAI
+import os
+import json
+import datetime
+import os.path
+
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+
+# ---------------------------------
+# CONFIG
+# ---------------------------------
+
+OPENAI_API_KEY = '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'
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+GCAL_SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
+
+app = Flask(__name__)
+
+VALID_MOODS = [
+    "normal",
+    "happy",
+    "sleepy",
+    "sad",
+    "excited",
+    "suspicious",
+    "surprised",
+    "love"
+]
+
+
+def get_time_bucket():
+    h = datetime.datetime.now().hour
+    if 5 <= h < 12:
+        return "morning"
+    elif 12 <= h < 17:
+        return "afternoon"
+    elif 17 <= h < 21:
+        return "evening"
+    else:
+        return "night"
+
+
+def clean_mood(value: str) -> str:
+    mood = (value or "normal").strip().lower()
+    return mood if mood in VALID_MOODS else "normal"
+
+
+# ---------------------------------
+# FALLBACK / AI
+# ---------------------------------
+
+def fallback_message(context):
+    trigger = context["trigger"]
+    weather = context["weather"]
+    city = context["city"]
+    tod = context["time_of_day"]
+    feels_like = context["feels_like"]
+    humidity = context["humidity"]
+
+    if trigger == "pomodoro_focus_start":
+        return {
+            "status": "ok",
+            "message": "Focus round starts now. Lock in steadily.",
+            "mood": "excited",
+            "show_seconds": 8
+        }
+
+    if trigger == "pomodoro_break_start":
+        return {
+            "status": "ok",
+            "message": "Break time now. Breathe and reset gently.",
+            "mood": "happy",
+            "show_seconds": 8
+        }
+
+    if trigger == "boot":
+        return {
+            "status": "ok",
+            "message": f"Good {tod}. DeskBuddy is ready.",
+            "mood": "happy",
+            "show_seconds": 8
+        }
+
+    if weather == "Clear":
+        if feels_like >= 30:
+            msg = f"Warm clear {tod} in {city}. A calm time to focus."
+        elif humidity >= 75:
+            msg = f"Clear but humid {tod} in {city}. Stay steady."
+        else:
+            msg = f"Clear {tod} in {city}. A calm time to focus."
+        return {"status": "ok", "message": msg, "mood": "normal", "show_seconds": 8}
+
+    if weather == "Clouds":
+        return {
+            "status": "ok",
+            "message": f"Cloudy {tod} in {city}. Work at an even pace.",
+            "mood": "normal",
+            "show_seconds": 8
+        }
+
+    if weather in ["Rain", "Drizzle"]:
+        return {
+            "status": "ok",
+            "message": f"Wet {tod} in {city}. Settle in and focus.",
+            "mood": "normal",
+            "show_seconds": 8
+        }
+
+    if weather == "Thunderstorm":
+        return {
+            "status": "ok",
+            "message": f"Stormy {tod} in {city}. Stay calm and steady.",
+            "mood": "surprised",
+            "show_seconds": 8
+        }
+
+    return {
+        "status": "ok",
+        "message": f"{tod.title()} in {city}. Keep a steady rhythm.",
+        "mood": "normal",
+        "show_seconds": 8
+    }
+
+
+def build_prompt(context):
+    trigger = context["trigger"]
+
+    if trigger == "boot":
+        task = """
+Generate a short startup greeting.
+Do not mention rain unless the input weather is Rain or Drizzle.
+"""
+    elif trigger == "pomodoro_focus_start":
+        task = """
+Generate a short focus-start message.
+It should feel energizing and work-oriented.
+Do not mention weather unless it naturally fits.
+"""
+    elif trigger == "pomodoro_break_start":
+        task = """
+Generate a short break-start message.
+It should feel relaxing and gentle.
+Do not mention weather unless it naturally fits.
+"""
+    else:
+        task = """
+Generate a weather-refresh message.
+STRICT:
+- Never invent weather conditions.
+- Must reflect weather exactly from the input.
+- If weather is Clear, do not mention rain.
+- If weather is Rain or Drizzle, do not mention clear skies.
+- Prefer weather_desc, feels_like, humidity, and clouds for realism.
+"""
+
+    return f"""
+You are DeskBuddy, a tiny desk companion robot.
+
+{task}
+
+GLOBAL RULES:
+- Return ONE short message only
+- Maximum 12 words
+- Warm, natural, concise
+- No emojis
+- Return valid JSON only
+- Allowed moods: normal, happy, sleepy, sad, excited, suspicious, surprised, love
+
+Context:
+City: {context['city']}
+Weather: {context['weather']}
+Weather description: {context['weather_desc']}
+Temperature: {context['temp']} C
+Feels like: {context['feels_like']} C
+Humidity: {context['humidity']} %
+Cloud cover: {context['clouds']} %
+Time of day: {context['time_of_day']}
+WiFi bars: {context['wifi_bars']}
+Mode: {context['mode']}
+Trigger: {context['trigger']}
+
+Return exactly:
+{{
+  "message": "...",
+  "mood": "..."
+}}
+"""
+
+
+def parse_model_json(text: str):
+    text = text.strip()
+
+    if text.startswith("```"):
+        lines = text.splitlines()
+        lines = [ln for ln in lines if not ln.strip().startswith("```")]
+        text = "\n".join(lines).strip()
+
+    return json.loads(text)
+
+
+def generate_ai_message(context):
+    if not OPENAI_API_KEY:
+        return {
+            "status": "error",
+            "message": "OPENAI_API_KEY not set",
+            "mood": "normal",
+            "show_seconds": 5
+        }
+
+    prompt = build_prompt(context)
+
+    try:
+        completion = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a tiny desk robot assistant. Be concise, contextual, and literal about weather."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            temperature=0.3
+        )
+
+        text = completion.choices[0].message.content or ""
+        result = parse_model_json(text)
+
+        mood = clean_mood(result.get("mood", "normal"))
+        message = (result.get("message", "") or "").strip()
+
+        if not message:
+            return fallback_message(context)
+
+        if len(message) > 80:
+            message = message[:80].rstrip()
+
+        return {
+            "status": "ok",
+            "message": message,
+            "mood": mood,
+            "show_seconds": 8
+        }
+
+    except Exception as e:
+        print("AI ERROR:", e)
+        return fallback_message(context)
+
+
+# ---------------------------------
+# GOOGLE CALENDAR
+# ---------------------------------
+
+LOCAL_TZ = datetime.datetime.now().astimezone().tzinfo
+
+
+def get_google_calendar_service():
+    creds = None
+
+    if os.path.exists("token.json"):
+        creds = Credentials.from_authorized_user_file("token.json", GCAL_SCOPES)
+
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(
+                "credentials.json", GCAL_SCOPES
+            )
+            creds = flow.run_local_server(port=0)
+
+        with open("token.json", "w") as token:
+            token.write(creds.to_json())
+
+    return build("calendar", "v3", credentials=creds)
+
+
+def simplify_event(event, now_dt):
+    title = event.get("summary", "Untitled meeting")
+    start_raw = event["start"].get("dateTime", event["start"].get("date"))
+    end_raw = event["end"].get("dateTime", event["end"].get("date"))
+
+    # Timed event
+    if "T" in start_raw:
+        start_dt = datetime.datetime.fromisoformat(start_raw.replace("Z", "+00:00"))
+        end_dt = datetime.datetime.fromisoformat(end_raw.replace("Z", "+00:00"))
+
+        start_local_dt = start_dt.astimezone(LOCAL_TZ)
+        end_local_dt = end_dt.astimezone(LOCAL_TZ)
+
+        minutes_left = int((start_local_dt - now_dt).total_seconds() / 60)
+
+        if start_local_dt <= now_dt <= end_local_dt:
+            state = "in_progress"
+        elif 0 <= minutes_left <= 10:
+            state = "starting_soon"
+        else:
+            state = "upcoming"
+
+        return {
+            "title": title,
+            "start_time": start_local_dt.strftime("%H:%M"),
+            "end_time": end_local_dt.strftime("%H:%M"),
+            "minutes_left": minutes_left,
+            "meeting_state": state,
+            "start_iso": start_local_dt.isoformat(),
+            "end_iso": end_local_dt.isoformat()
+        }
+
+    # All-day event
+    return {
+        "title": title,
+        "start_time": start_raw,
+        "end_time": end_raw,
+        "minutes_left": -1,
+        "meeting_state": "all_day",
+        "start_iso": start_raw,
+        "end_iso": end_raw
+    }
+
+
+def get_next_meeting():
+    try:
+        service = get_google_calendar_service()
+
+        now_dt = datetime.datetime.now(LOCAL_TZ)
+        now_utc = now_dt.astimezone(datetime.timezone.utc).isoformat()
+
+        events_result = service.events().list(
+            calendarId="primary",
+            timeMin=now_utc,
+            maxResults=3,
+            singleEvents=True,
+            orderBy="startTime",
+        ).execute()
+
+        events = events_result.get("items", [])
+
+        if not events:
+            return {
+               "status": "ok",
+                "meeting_state": "free",
+                "title": "You're free",
+                "start_time": "",
+                "end_time": "",
+                "minutes_left": -1,
+                "events": []
+            }
+
+        simplified = [simplify_event(event, now_dt) for event in events]
+        first = simplified[0]
+
+        return {
+            "status": "ok",
+            "meeting_state": first["meeting_state"],
+            "title": first["title"],
+            "start_time": first["start_time"],
+            "end_time": first["end_time"],
+            "minutes_left": first["minutes_left"],
+            "events": simplified
+        }
+
+    except Exception as e:
+        print("GCAL ERROR:", e)
+        return {
+            "status": "error",
+            "meeting_state": "unknown",
+            "title": "Calendar unavailable",
+            "start_time": "",
+            "end_time": "",
+            "minutes_left": -1,
+            "events": []
+        }
+# ---------------------------------
+# API ENDPOINTS
+# ---------------------------------
+
+@app.route("/deskbuddy-message", methods=["POST"])
+def deskbuddy_message():
+    data = request.json or {}
+
+    context = {
+        "city": data.get("city", "Unknown"),
+        "weather": data.get("weather", "Clear"),
+        "weather_desc": data.get("weather_desc", "clear sky"),
+        "temp": data.get("temp", 25),
+        "feels_like": data.get("feels_like", 25),
+        "humidity": data.get("humidity", 50),
+        "clouds": data.get("clouds", 0),
+        "wifi_bars": data.get("wifi_bars", 4),
+        "mode": data.get("mode", "normal"),
+        "trigger": data.get("trigger", "periodic"),
+        "time_of_day": data.get("time_of_day", get_time_bucket())
+    }
+
+    response = generate_ai_message(context)
+    return jsonify(response)
+
+@app.route("/deskbuddy-message-test", methods=["GET"])
+def deskbuddy_message_test():
+    context = {
+        "city": "Mumbai",
+        "weather": "Clear",
+        "weather_desc": "clear sky",
+        "temp": 28,
+        "feels_like": 30,
+        "humidity": 70,
+        "clouds": 0,
+        "wifi_bars": 4,
+        "mode": "focus",
+        "trigger": "weather_refresh",
+        "time_of_day": "night"
+    }
+    return jsonify(generate_ai_message(context))
+##@app.route("/deskbuddy-calendar", methods=["GET"])
+##def deskbuddy_calendar():
+##    return jsonify(get_next_meeting())
+##
+##
+##@app.route("/deskbuddy-calendar-test", methods=["GET"])
+##def deskbuddy_calendar_test():
+##    data = get_next_meeting()
+##    return jsonify({
+##        "status": data["status"],
+##        "meeting_state": data["meeting_state"],
+##        "title": data["title"],
+##        "start_time": data["start_time"],
+##        "minutes_left": data["minutes_left"]
+##    })
+
+@app.route("/deskmate-calendar", methods=["GET"])
+def deskbuddy_calendar():
+    return jsonify(get_next_meeting())
+
+
+@app.route("/deskbuddy-calendar-test", methods=["GET"])
+def deskbuddy_calendar_test():
+    return jsonify(get_next_meeting())
+
+# ---------------------------------
+# HEALTH CHECK
+# ---------------------------------
+
+@app.route("/")
+def home():
+    return jsonify({
+        "service": "DeskBuddy AI",
+        "status": "running"
+    })
+
+
+# ---------------------------------
+# RUN SERVER
+# ---------------------------------
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5003, debug=True)
